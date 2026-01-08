@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Write;
 use std::str::FromStr;
 use anyhow::{Result, Context as _, bail};
 use openssl::{
@@ -29,6 +31,7 @@ const TPM_URI: &str = "host=localhost,port=2321";
 const NV_INDEX_EK_CERT: u32 = 0x01c00002;
 const EK_KEY_BITS: u32 = 2048;
 const NV_WRITE_CHUNK_SIZE: usize = 512;
+const CA_CERT_FILENAME : &str = "local_ca.pem";
 
 fn main() -> Result<()> {
     println!("TPM EK Certificate Provisioning");
@@ -45,18 +48,21 @@ fn main() -> Result<()> {
     let (ca_key, ca_cert) = create_ca()?;
     println!("Generated local Root CA.");
 
-    /* 4. Sign EK with CA (Issue Certificate) */
+    /* 4. Write CA to a file on disk */
+    write_cert_to_file(&ca_cert, CA_CERT_FILENAME)?;
+
+    /* 5. Sign EK with CA (Issue Certificate) */
     let ek_cert_der = generate_signed_ek_cert(&mut context, ek_handle, &ca_key, &ca_cert)?;
     println!("Signed EK Certificate (Size: {} bytes).", ek_cert_der.len());
 
-    /* 5. Store Certificate in NVRAM */
+    /* 6. Store Certificate in NVRAM */
     write_cert_to_nvram(&mut context, &ek_cert_der)?;
 
-    /* 6. Final Verification */
+    /* 7. Final Verification */
     verify_nvram_index(&mut context)?;
-    println!("Verification Successful: Certificate stored in NVRAM.");
+    println!("Verification Successful: EK Certificate stored in NVRAM.");
 
-    /* 7. Print Verification Instructions */
+    /* 8. Print Verification Instructions */
     print_verification_instructions();
 
     Ok(())
@@ -90,6 +96,13 @@ fn print_verification_instructions() {
     println!("      From the Certificate:");
     println!("      openssl rsa -pubin -in cert_key.pem -text -noout");
     println!("   The \"Modulus\" sections in both outputs must match exactly.");
+
+
+    println!("4. Verify the chain using OpenSSL and the local CA file:");
+    println!("   openssl x509 -in ek_cert.der -inform DER -noout -subject -issuer");
+    println!("   openssl verify -CAfile {} -untrusted ek_cert.der ek_cert.der", CA_CERT_FILENAME);
+    println!("   (Note: 'OK' means the chain is valid)");
+
     println!("===============================");
 }
 
@@ -140,6 +153,14 @@ fn create_ca() -> Result<(PKey<Private>, X509)> {
     builder.sign(&privkey, MessageDigest::sha256())?;
 
     Ok((privkey, builder.build()))
+}
+
+fn write_cert_to_file(ca_cert: &X509, filename: &str) -> Result<()>{
+    let pem = ca_cert.to_pem()?;
+    let mut file = File::create(filename).context("Failed to create CA cert file")?;
+    file.write_all(&pem).context("Failed to write CA cert to file")?;
+    println!("[+] Saved CA Certificate to disk: {}", filename);
+    Ok(())
 }
 
 /* Signs the TPM's EK Public Key with our local CA. */
@@ -210,13 +231,16 @@ fn write_cert_to_nvram(context: &mut Context, cert_data: &[u8]) -> Result<()> {
         )
         .build()?;
 
-    let nv_handle_obj = match context.nv_define_space(Provision::Owner, None, nv_public) {
+    let nv_handle_obj = match context.nv_define_space(
+                                                      Provision::Owner,
+                                                      None,
+                                                      nv_public) {
         Ok(h) => h,
         Err(e) => {
             // Check for TPM_RC_NV_DEFINED (0x14c) by code or description
             let err_msg = e.to_string();
             if err_msg.contains("0x14c") || err_msg.contains("already defined") {
-                println!("[!] NV Index {:#x} already exists. Skipping write.", NV_INDEX_EK_CERT);
+                println!("NV Index {:#x} already exists. Skipping write.", NV_INDEX_EK_CERT);
                 return Ok(());
             }
             return Err(e.into());
@@ -229,12 +253,15 @@ fn write_cert_to_nvram(context: &mut Context, cert_data: &[u8]) -> Result<()> {
         let size = std::cmp::min(cert_data.len() - offset, NV_WRITE_CHUNK_SIZE);
         let chunk = MaxNvBuffer::try_from(cert_data[offset..offset + size].to_vec())?;
 
-        context.nv_write(NvAuth::Owner, nv_handle_obj, chunk, offset as u16)
+        context.nv_write(NvAuth::Owner,
+                         nv_handle_obj,
+                         chunk,
+                         offset as u16)
             .context("Failed to write certificate chunk to NVRAM")?;
 
         offset += size;
     }
-    println!("[+] Stored Certificate in NVRAM (Index: {:#x}).", NV_INDEX_EK_CERT);
+    println!("Stored Certificate in NVRAM (Index: {:#x}).", NV_INDEX_EK_CERT);
     Ok(())
 }
 
